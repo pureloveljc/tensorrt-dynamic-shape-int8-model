@@ -1,0 +1,213 @@
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch import nn
+import torch.optim as optim
+import torchvision
+#pip install torchvision
+from torchvision import transforms, models, datasets
+#https://pytorch.org/docs/stable/torchvision/index.html
+import imageio
+import time
+import warnings
+import random
+import sys
+import copy
+import json
+import cv2
+from PIL import Image
+import torch.utils.data
+from demo_digit import init_model,  \
+     im_convert , cat_to_name, dataloaders,class_names
+torch.set_printoptions(precision=4, sci_mode=False)
+feature_extract = False
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")   # mobilenetv3 fps:130.41179031154778  resnet18 ??????200fps
+# model_name = 'mobilenetv3'
+model_name = "resnet18"
+# model_ft, input_size = init_model(model_name, 22, feature_extract, use_pretrained=False)
+
+model_ft = models.resnet18()
+nums_ftrs = model_ft.fc.in_features
+# model_ft.fc = nn.Sequential(nn.Linear(nums_ftrs, 154),
+#                             nn.LogSoftmax(dim=1))
+model_ft.fc = nn.Sequential(nn.Linear(nums_ftrs, 154),
+                            nn.LogSoftmax(dim=1))
+# model_ft = models.mobilenet_v3_large()
+# nums_ftrs = model_ft.classifier[3].in_features
+# model_ft.classifier[3] = nn.Sequential(nn.Linear(nums_ftrs, 22),
+#                                        nn.LogSoftmax(dim=1))
+# GPU????
+model_ft = model_ft.to(device)
+
+# ???????????????
+filename = '/mnt/stg3/dragon/ljc/pytorch_demo/pytorch_demo/checkpoint_resnet34_icon_0819_class154_128.pth'   # resnet18 ??????200fps
+
+# ????????
+checkpoint = torch.load(filename)
+best_acc = checkpoint['best_acc']
+model_ft.load_state_dict(checkpoint['state_dict'])
+# clss = checkpoint[""]
+
+
+
+def transform_aug(image_path):
+    img = Image.open(image_path).convert('RGB')
+    trans = transforms.Compose([
+        # transforms.Resize(224),
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+        # transforms.Normalize([0, 0, 0], [1, 1, 1]),
+transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    return trans(img)
+def process_image(image_path):
+    # ????????????
+    img = Image.open(image_path)
+    #Resize,thumbnail????????????????????????????????
+    print(img.size)
+    if img.size[0] > img.size[1]:
+        img.thumbnail((10000, 256))
+    else:
+        img.thumbnail((256, 10000))
+    #Crop????
+    left_margin = (img.width - 64) / 2
+    bottom_margin = (img.height - 64) / 2
+    right_margin = left_margin + 64
+    top_margin = bottom_margin + 64
+    img = img.crop((left_margin, bottom_margin, right_margin,
+                    top_margin))
+    # ????????????????
+    img1 = cv2.imread(image_path)
+    print(img1.shape())
+    # cv_img = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+    #
+    # img = cv2.imread(image_path)
+    # img = cv2.resize(img, (64, 64))
+    # cv2.imshow("img", img)
+    # cv2.waitKey(0)
+    print(img.size)
+    img = np.array(img) / 255
+    mean = np.array([0.485, 0.456, 0.406])  # provided mean
+    std = np.array([0.229, 0.224, 0.225])  # provided std
+    img = (img - mean) / std
+    # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    # ??????????????????????????????
+    img = img.transpose((2, 0, 1))
+
+    return img
+
+
+def imshow(image, ax=None, title=None):
+    """????????"""
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    # ????????????
+    image = np.array(image).transpose((1, 2, 0))
+
+    # ??????????
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    image = std * image + mean
+    image = np.clip(image, 0, 1)
+    cv2.imshow("img", image)
+    cv2.waitKey(0)
+    # ax.imshow(image)
+    # ax.set_title(title)
+
+    # return ax
+
+# data_dir = '/mnt/stg3/dragon/ljc/pytorch_demo/icon_all/'
+# train_dir = data_dir+'/train'
+# valid_dir = data_dir+'/valid'
+# image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x)) for x in ['train', 'valid']}
+#
+# dataset_sizes = {x: len(image_datasets[x]) for x in ["train", "valid"]}
+class_names = ['cls1', 'cls2', 'cls3']
+
+print(len(class_names))
+
+# print(class_names)
+
+def softmax(x):
+    x = x.reshape(-1)
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum(axis=0)
+
+
+def raw(): # ????????
+    result = []
+    for class_name in os.listdir("/mnt/stg3/dragon/ljc/pytorch_demo/icon_all/0818/true_test/"):
+        acc_count = 0
+        all_count = 0
+        for c, cls in enumerate(os.listdir(os.path.join("//mnt/stg3/dragon/ljc/pytorch_demo/icon_all/0818/true_test//", class_name))):
+            all_count += 1
+            image_path = os.path.join(os.path.join("//mnt/stg3/dragon/ljc/pytorch_demo/icon_all/0818/true_test//", class_name), cls)
+            # print(image_path)
+            start = time.time()
+            # img = process_image(image_path)
+            img = transform_aug(image_path)
+            #img.transpose((2, 0, 1))j cl
+
+            # img.save("./train_target3.png", format='PNG')
+            train_on_gpu = torch.cuda.is_available()
+            if train_on_gpu:
+                imgs = np.expand_dims(img, axis=0)
+                x_data = torch.tensor(imgs)
+                x_data = x_data.type(torch.FloatTensor)
+                # print(x_data.size())
+                model_ft.eval()
+                output = model_ft(x_data.cuda())
+#                 print(model_ft.fc.in_features)
+                # a = np.argmax(softmax(output))
+                _, preds_tensor = torch.max(output, 1)
+                # results = [class_names[np.argmax(softmax(output[i, :]))] if softmax(output[i, :])[np.argmax(
+                #     softmax(output[i, :]))] > 0.85 else "????????" for i in range(output.shape[0])]
+                preds = np.squeeze(preds_tensor.numpy()) if not train_on_gpu else np.squeeze(preds_tensor.cpu().numpy())
+                end = time.time()
+                # print("fps:"+(str(1/(end-start))))
+                # print(class_names[preds])
+                if class_name == "??":
+                    print(class_names[preds])
+                if class_names[preds] == class_name:
+                    acc_count += 1
+        result.append([class_name, acc_count/all_count, all_count])
+        # print("class_name: {} acc :".format(class_name)+str(acc_count/all_count) + ", val nums:"+str(all_count))
+    for i in range(len(result)-1):
+        for j in range(len(result)-1-i):
+            if result[j][1] > result[j+1][1]:
+                result[j], result[j+1] = result[j+1], result[j]
+    for i in result:
+        print("class_name: {} acc :".format(i[0]) + str(i[1]) + ", val nums:" + str(i[2]))
+    # imshow(img)
+    # plt.show()
+raw()
+
+# ????????batch??????????
+# dataiter = iter(dataloaders['valid'])
+# images, labels = dataiter.next()
+#
+# model_ft.eval()
+#
+# train_on_gpu = torch.cuda.is_available()
+# if train_on_gpu:
+#     output = model_ft(images.cuda())
+#     print(images.shape)
+# else:
+#     output = model_ft(images)
+#
+# _, preds_tensor = torch.max(output, 1)
+#
+# preds = np.squeeze(preds_tensor.numpy()) if not train_on_gpu else np.squeeze(preds_tensor.cpu().numpy())
+#
+# fig=plt.figure(figsize=(20, 20))
+# columns =4
+# rows = 2
+#
+# for idx in range (columns*rows):
+#     ax = fig.add_subplot(rows, columns, idx+1, xticks=[], yticks=[])
+#     plt.imshow(im_convert(images[idx]))
+#     ax.set_title("{} ({})".format(cat_to_name[str(preds[idx])], cat_to_name[str(labels[idx].item())]),
+#                  color=("green" if cat_to_name[str(preds[idx])]==cat_to_name[str(labels[idx].item())] else "red"))
+# plt.show()
