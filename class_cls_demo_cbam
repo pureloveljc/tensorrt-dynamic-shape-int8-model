@@ -1,0 +1,427 @@
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch import nn
+import torch.optim as optim
+import torchvision
+#pip install torchvision
+from torchvision import transforms, models, datasets
+#https://pytorch.org/docs/stable/torchvision/index.html
+import imageio
+import time
+import warnings
+import random
+import sys
+import copy
+import json
+from PIL import Image
+import torch.utils.data
+from test_cbam import SpatialAttention
+from test_cbam import ChannelAttention
+from test_cbam import CBAM
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+torch.set_num_threads(1)
+data_dir = '/mnt/stg3/dragon/ljc/pytorch_demo/icon_all/0818/'
+train_dir = data_dir+'/train'
+valid_dir = data_dir+'/valid'
+
+data_transforms = {
+    'train': transforms.Compose([
+
+        # transforms.RandomRotation(15),#??????????-45??45????????????
+                                 # transforms.Resize(80),
+        transforms.Resize((128, 128)),#??????????????
+        # transforms.RandomHorizontalFlip(p=0.5),#???????????? ????????????????
+        # transforms.RandomVerticalFlip(p=0.5),#????????????
+       transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),#????1????????????2??????????????3??????????????4??????
+        # transforms.RandomGrayscale(p=0.025),#??????????????????3????????R=G=B
+
+       #  transforms.ColorJitter(brightness=0.1),
+        transforms.ToTensor(),
+       #  transforms.Normalize([0, 0, 0], [1, 1, 1]),#??????????????????,
+transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'valid': transforms.Compose([
+        # transforms.Resize(224),
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+        # transforms.Normalize([0, 0, 0], [1, 1, 1]),
+transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+}
+
+
+batch_size = 16
+
+image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x]) for x in ['train', 'valid']}
+dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, pin_memory=True) for x in ["train", "valid"]}
+
+dataset_sizes = {x: len(image_datasets[x]) for x in ["train", "valid"]}
+print(dataset_sizes)
+class_names = image_datasets["train"].classes
+
+# print(class_names)
+
+with open("icon_to_name.json", "r") as f:
+    cat_to_name = json.load(f)
+print(cat_to_name)
+
+
+
+def im_convert(tensor):
+    image = tensor.to("cpu").clone().detach()
+    image = image.numpy().squeeze()
+    image = image.transpose(1, 2, 0)
+    image = image*np.array((0.228, 0.224, 0.225)) + np.array((0.485, 0.456, 0.406))
+    image = image.clip(0, 1)
+    return image
+
+
+
+
+  #???????????? ['resnet', 'alexnet', 'vgg', 'squeezenet', 'densenet', 'inception']
+#??????????????????????????
+
+def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        for param in model.parameters():
+            param.requires_grad = True
+
+
+# model_ft = models.resnet152()
+# model_ft_mob = models.mobilenet_v3_large()
+# print(model_ft_mob)
+
+
+def init_model(model_name, num_classes, feature_extract, use_pretrained=True):
+    model_ft = None
+    input_size = 0
+
+    if model_name == "resnet":
+        """
+        """
+        model_ft = models.resnet18(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+
+        nums_ftrs = model_ft.fc.in_features
+        print(nums_ftrs)
+        model_ft.fc = nn.Sequential(nn.Linear(nums_ftrs, 37),
+                                    nn.LogSoftmax(dim=1))
+        input_size = 60
+    elif model_name == "alexnet":
+        """ Alexnet
+        """
+        model_ft = models.alexnet(pretrained=use_pretrained)
+        print(model_ft)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier[6].in_features
+
+        model_ft.classifier[6] = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+    elif model_name == "mobilenetv3":
+        """ mobilenetv3
+        """
+
+        model_ft = models.mobilenet_v3_large(pretrained=use_pretrained)
+        print(model_ft)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        nums_ftrs = model_ft.classifier[3].in_features
+        print(nums_ftrs)
+        # model_ft.fc = nn.Sequential(nn.Linear(nums_ftrs, 102),
+        #                             nn.LogSoftmax(dim=1))
+        # model_ft.classifier[3] = nn.Linear(nums_ftrs, num_classes)
+        model_ft.classifier[3] = nn.Sequential(nn.Linear(nums_ftrs, 22),
+                                    nn.LogSoftmax(dim=1))
+        input_size = 224
+    elif model_name == "resnet18":
+        """ resnet18
+        """
+
+        model_ft = models.resnet18(pretrained=use_pretrained)
+
+        cbam_custom_64 = CBAM(64)
+        cbam_custom_128 = CBAM(128)
+        cbam_custom_256 = CBAM(256)
+        cbam_custom_512 = CBAM(512)
+
+        # model_copy = copy.deepcopy(model_ft)
+        model_ft.layer1 = nn.Sequential(model_ft.layer1[0], cbam_custom_64, model_ft.layer1[1], cbam_custom_64)
+        model_ft.layer2 = nn.Sequential(model_ft.layer2[0], cbam_custom_128, model_ft.layer2[1], cbam_custom_128)
+        model_ft.layer3 = nn.Sequential(model_ft.layer3[0], cbam_custom_256, model_ft.layer3[1], cbam_custom_256)
+        model_ft.layer4 = nn.Sequential(model_ft.layer4[0], cbam_custom_512, model_ft.layer4[1], cbam_custom_512)
+
+        set_parameter_requires_grad(model_ft, feature_extract)
+        nums_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Sequential(nn.Linear(nums_ftrs, 154),
+                                    nn.LogSoftmax(dim=1))
+
+        input_size = 128
+        # filename = '/mnt/stg3/dragon/ljc/pytorch_demo/pytorch_demo/checkpoint_resnet34_icon_0819_class154_128.pth'  # resnet18 ??????200fps
+        #
+        # # ????????
+        # checkpoint = torch.load(filename)
+        # best_acc = checkpoint['best_acc']
+        # model_ft.load_state_dict(checkpoint['state_dict'])
+
+    return model_ft, input_size
+
+
+#model_ft.class_to_idx = checkpoint['mapping']
+
+def train_model(model, dataloaders, FocalLoss, optimizer, filename, num_epochs=25 , is_inception=False ):
+    since = time.time()
+    best_acc = 0
+    """
+    checkpoint = torch.load(filename)
+    best_acc = checkpoint['best_acc']
+    model.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer'])device
+    model.class_to_idx = checkpoint['mapping']
+    """
+    model.to(device)
+
+    val_acc_history = []
+    train_acc_history = []
+    train_losses = []
+    valid_losses = []
+    LRs = [optimizer.param_groups[0]['lr']]
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    # focal = FocalLoss([0.2]*154, 2)
+    # focal_2 = Focal_Loss(0.2)
+    # focal_3 = Focal_3Loss(154)
+    focal_4 = MultiFocalLoss(154, smooth=0.1)
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
+
+        # ??????????
+        for phase in ['train', 'valid']:
+            if phase == 'train':
+                model.train()  # ????
+            else:
+                model.eval()  # ????
+
+            running_loss = 0.0
+            running_corrects = 0.0
+
+            # ??????????????
+            for inputs, labels in dataloaders[phase]:
+                # print(device)
+                inputs = inputs.to(device)
+                # print(inputs.shape)
+                labels = labels.to(device)
+
+                # ????
+                optimizer.zero_grad()
+                # ????????????????????????????
+                with torch.set_grad_enabled(phase == 'train'):
+                    # print(is_inception)
+                    if is_inception and phase == 'train':
+                        outputs, aux_outputs = model(inputs)
+                        loss1 = criterion(outputs, labels)
+                        loss2 = criterion(aux_outputs, labels)
+                        loss = loss1 + 0.4 * loss2
+                    else:  # resnet????????????
+                        outputs = model(inputs)
+                        # loss = focal(outputs, labels)
+                        # print('focal')
+                        loss = focal_4.forward(outputs, labels)
+
+                    _, preds = torch.max(outputs, 1)
+
+                    # ????????????????
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                # ????????
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / len(dataloaders[phase].dataset)
+            epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
+
+            time_elapsed = time.time() - since
+            print('Time elapsed {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+            print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
+
+            # ??????????????????
+            if phase == 'valid' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_model_wts = copy.deepcopy(model.state_dict())
+                state = {
+                    'state_dict': model.state_dict(),
+                    'best_acc': best_acc,
+                    'optimizer': optimizer.state_dict(),
+                }
+                torch.save(state, filename)
+            if phase == 'valid':
+                val_acc_history.append(epoch_acc)
+                valid_losses.append(epoch_loss)
+                # scheduler.step(epoch_loss)
+            if phase == 'train':
+                train_acc_history.append(epoch_acc)
+                train_losses.append(epoch_loss)
+
+
+
+        print('Optimizer learning rate : {:.7f}'.format(optimizer.param_groups[0]['lr']))
+        LRs.append(optimizer.param_groups[0]['lr'])
+        scheduler.step()
+        print()
+
+    time_elapsed = time.time() - since
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    print('Best val Acc: {:4f}'.format(best_acc))
+
+    # ??????????????????????????????????????
+    model.load_state_dict(best_model_wts)
+    return model, val_acc_history, train_acc_history, valid_losses, train_losses, LRs
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+
+
+class MultiFocalLoss(nn.Module):
+    """
+    This is a implementation of Focal Loss with smooth label cross entropy supported which is proposed in
+    'Focal Loss for Dense Object Detection. (https://arxiv.org/abs/1708.02002)'
+        Focal_Loss= -1*alpha*(1-pt)^gamma*log(pt)
+    :param num_class:
+    :param alpha: (tensor) 3D or 4D the scalar factor for this criterion
+    :param gamma: (float,double) gamma > 0 reduces the relative loss for well-classified examples (p>0.5) putting more
+                    focus on hard misclassified example
+    :param smooth: (float,double) smooth value when cross entropy
+    :param balance_index: (int) balance class index, should be specific when alpha is float
+    :param size_average: (bool, optional) By default, the losses are averaged over each loss element in the batch.
+    """
+
+    def __init__(self, num_class, alpha=None, gamma=2, balance_index=-1, smooth=None, size_average=True):
+        super(MultiFocalLoss, self).__init__()
+        self.num_class = num_class
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smooth = smooth
+        self.size_average = size_average
+
+        if self.alpha is None:
+            self.alpha = torch.ones(self.num_class, 1)
+        elif isinstance(self.alpha, (list, np.ndarray)):
+            assert len(self.alpha) == self.num_class
+            self.alpha = torch.FloatTensor(alpha).view(self.num_class, 1)
+            self.alpha = self.alpha / self.alpha.sum()
+        elif isinstance(self.alpha, float):
+            alpha = torch.ones(self.num_class, 1)
+            alpha = alpha * (1 - self.alpha)
+            alpha[balance_index] = self.alpha
+            self.alpha = alpha
+        else:
+            raise TypeError('Not support alpha type')
+
+        if self.smooth is not None:
+            if self.smooth < 0 or self.smooth > 1.0:
+                raise ValueError('smooth value should be in [0,1]')
+
+    def forward(self, input, target):
+        logit = F.softmax(input, dim=1)
+
+        if logit.dim() > 2:
+            # N,C,d1,d2 -> N,C,m (m=d1*d2*...)
+            logit = logit.view(logit.size(0), logit.size(1), -1)
+            logit = logit.permute(0, 2, 1).contiguous()
+            logit = logit.view(-1, logit.size(-1))
+        target = target.view(-1, 1)
+
+        # N = input.size(0)
+        # alpha = torch.ones(N, self.num_class)
+        # alpha = alpha * (1 - self.alpha)
+        # alpha = alpha.scatter_(1, target.long(), self.alpha)
+        epsilon = 1e-10
+        alpha = self.alpha
+        if alpha.device != input.device:
+            alpha = alpha.to(input.device)
+
+        idx = target.cpu().long()
+        one_hot_key = torch.FloatTensor(target.size(0), self.num_class).zero_()
+        one_hot_key = one_hot_key.scatter_(1, idx, 1)
+        if one_hot_key.device != logit.device:
+            one_hot_key = one_hot_key.to(logit.device)
+
+        if self.smooth:
+            one_hot_key = torch.clamp(
+                one_hot_key, self.smooth, 1.0 - self.smooth)
+        pt = (one_hot_key * logit).sum(1) + epsilon
+        logpt = pt.log()
+
+        gamma = self.gamma
+
+        alpha = alpha[idx]
+        loss = -1 * alpha * torch.pow((1 - pt), gamma) * logpt
+
+        if self.size_average:
+            loss = loss.mean()
+        else:
+            loss = loss.sum()
+        return loss
+
+
+
+if __name__ == "__main__":
+    model_name = 'resnet18'
+    feature_extract = True
+    filename = 'checkpoint_resnet18_icon_0822_class154.pth'
+    # ??????GPU????
+    train_on_gpu = torch.cuda.is_available()
+
+    if not train_on_gpu:
+        print('CUDA is not available.  Training on CPlU ...')
+    else:
+        print('CUDA is available!  Training on GPU ...')
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model_ft, input_size = init_model(model_name, 154, feature_extract, use_pretrained=True)
+    model_ft = model_ft.to(device)
+
+    if feature_extract:
+        params_to_update = []
+        for name, param in model_ft.named_parameters():
+            if param.requires_grad == True:
+                params_to_update.append(param)
+                print("\t", name)
+    else:
+        for name, param in model_ft.named_parameters():
+            if param.requires_grad == True:
+                print("\t", name)
+
+    params_to_update = model_ft.parameters()
+    # optimizer_ft = optim.Adam(params_to_update, lr=0.002)
+    optimizer_ft = optim.Adam(params_to_update, lr=1e-2)
+    scheduler = optim.lr_scheduler.StepLR(optimizer_ft, step_size=10, gamma=0.1)  # ????????7??epoch????????????1/10
+
+    # ????????????LogSoftmax()????????????nn.CrossEntropyLoss()??????????nn.CrossEntropyLoss()??????logSoftmax()??nn.NLLLoss()????
+    criterion = nn.NLLLoss()
+    model_ft, val_acc_history, train_acc_history, valid_losses, train_losses, LRs = train_model(model_ft, dataloaders, criterion, optimizer_ft,
+                                                                                                 filename=filename, num_epochs=150, is_inception=(model_name=="inception"))
+
+
+
+# model_ft, input_size = initialize_model(model_name, 102, feature_extract, use_pretrained=True)
+#
+# # GPU????
+# model_ft = model_ft.to(device)
+#
+# #???????????????
+# filename='seriouscheckpoint.pth'
+#
+# # ????????
+# checkpoint = torch.load(filename)
+# best_acc = checkpoint['best_acc']
+# model_ft.load_state_dict(checkpoint['state_dict'])
+
