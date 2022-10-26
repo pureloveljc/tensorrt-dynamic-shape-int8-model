@@ -1,0 +1,94 @@
+import onnxruntime
+import cv2
+import numpy as np
+import time
+from scipy.spatial.distance import pdist
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
+
+try:
+    from torchvision.transforms import InterpolationMode
+    BICUBIC = InterpolationMode.BICUBIC
+except ImportError:
+    BICUBIC = Image.BICUBIC
+
+
+def cosine_distance(a, b):
+    if a.shape != b.shape:
+        raise RuntimeError("array {} shape not match {}".format(a.shape, b.shape))
+    if a.ndim == 1:
+        a_norm = np.linalg.norm(a)
+        b_norm = np.linalg.norm(b)
+    elif a.ndim == 2:
+        a_norm = np.linalg.norm(a, axis=1, keepdims=True)
+        b_norm = np.linalg.norm(b, axis=1, keepdims=True)
+    else:
+        raise RuntimeError("array dimensions {} not right".format(a.ndim))
+    similiarity = np.dot(a, b.T)/(a_norm * b_norm)
+    dist = 1. - similiarity
+    return dist, similiarity
+
+
+def resize_norm_img(img_path):
+    # print(img_path)
+
+    img_path = cv2.imread(img_path)
+    #  img_path = cv2.cvtColor(img_path, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img_path, (224, 224))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    std = np.array([0.26862954, 0.26130258, 0.27577711]).reshape(
+        (1, 1, 3)).astype('float32')
+    mean = np.array([0.48145466,  0.4578275, 0.40821073]).reshape(
+        (1, 1, 3)).astype('float32')
+    img = (img.astype(np.float32) / 255.0 - mean) / std
+
+    img_hwc = np.transpose(img, (2, 1, 0))
+
+    # img = img[:, :, [2, 1, 0]]
+    img = np.expand_dims(img_hwc, 0)
+    # img = img[np.newaxis, :]
+    # print(img.shape)
+    return img
+
+
+model_path = "/home/longce/ljc/code/CLIP/clip_ViT-B_32.onnx"
+sess = onnxruntime.InferenceSession(
+    model_path, providers=['CPUExecutionProvider'])
+
+img_1 = "/home/longce/ljc/icon_all/0906/valid/????/imgaug2_????025.jpg"
+img_3 = "/home/longce/ljc/icon_all/0906/valid/????/imgaug2_????061.jpg"
+img_2 = "/home/longce/ljc/icon_all/0906/valid/????/imgaug2_????015.jpg"
+# batch_img = []
+
+dst_img1 = resize_norm_img(img_1)
+dst_img2 = resize_norm_img(img_2)
+print(dst_img1.shape)
+# batch_img.append(dst_img)
+# if not batch_img:
+#     return []
+# batch_img = np.concatenate(batch_img)
+# img = img.numpy()
+while True:
+    start_time = time.time()
+    pred1 = sess.run(['output'], {'input': dst_img1})[0]
+    pred2 = sess.run(['output'], {'input': dst_img2})[0]
+    numpy_pred1 = np.array(pred1[0])
+    numpy_pred2 = np.array(pred2[0])
+
+    d, similiarity = cosine_distance(numpy_pred1, numpy_pred2)
+
+    dist = pdist(np.vstack([numpy_pred1, numpy_pred2]), 'cosine')
+    similiarity2 = 1 - dist
+    end_time = time.time()
+    print(similiarity)
+    print(end_time-start_time)
+# print(pred1[0])
+# print(pred2[0])
+
+# dist = np.linalg.norm(numpy_pred1- numpy_pred2)
+
+# print(similiarity)
+# print(similiarity2)
+# print(dist)
+# print(len(pred1))
+# print(len(pred2))
