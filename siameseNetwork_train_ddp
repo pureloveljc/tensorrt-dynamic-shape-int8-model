@@ -1,0 +1,170 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from SiameseDataset_data import SiameseDataset
+from torchvision.datasets import ImageFolder
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import os
+
+# class BaseNetwork(nn.Module):
+#     def __init__(self, input_shape):
+#         super(BaseNetwork, self).__init__()
+#         self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=3, padding=1)
+#         self.relu = nn.ReLU(inplace=True)
+#         self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
+#         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+#         self.fc = nn.Linear(64 * input_shape[1]//4 * input_shape[2]//4, 128)
+#
+#     def forward(self, x):
+#         x = self.conv1(x)
+#         x = self.relu(x)
+#         x = self.maxpool(x)
+#         x = self.conv2(x)
+#         x = self.relu(x)
+#         x = self.maxpool(x)
+#         x = x.view(x.size(0), -1)
+#         x = self.fc(x)
+#         return x
+
+from torchvision.models import resnet34
+
+
+class BaseNetwork(nn.Module):
+    def __init__(self, pretrained=True):
+        super(BaseNetwork, self).__init__()
+        self.resnet34 = resnet34(pretrained=pretrained)
+        self.resnet34 = nn.Sequential(*list(self.resnet34.children())[:-1])
+
+    def forward(self, x):
+        x = self.resnet34(x)
+        x = x.view(x.size(0), -1)
+        return x
+
+
+class SiameseNetwork(nn.Module):
+    def __init__(self, input_shape):
+        super(SiameseNetwork, self).__init__()
+        self.base_network = BaseNetwork(input_shape)
+        # self.fc = nn.Linear(128, 1)
+        self.fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input1, input2):
+        features1 = self.base_network(input1)
+        features2 = self.base_network(input2)
+        distance = torch.abs(features1 - features2)
+        similarity_score = self.sigmoid(self.fc(distance))
+        return similarity_score
+
+
+
+def to_rgb(image):
+    if image.mode != 'RGB':
+        return image.convert('RGB')
+    return image
+
+
+def compute_accuracy(predictions, targets):
+    return (predictions.round() == targets).float().mean().item()
+
+best_accuracy = 0
+model_path = "best_siamese_network.pth"
+
+
+def train_ddp(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    best_accuracy = 0
+    torch.distributed.init_process_group(
+        "nccl", rank=rank, world_size=world_size
+    )
+    input_shape = (3, 224, 224)
+    siamese_network = SiameseNetwork(input_shape).to(rank)
+    siamese_network = DDP(siamese_network, device_ids=[rank])
+
+    criterion = nn.BCELoss().to(rank)
+    optimizer = optim.Adam(siamese_network.parameters(), lr=0.001)
+
+    data_transforms = transforms.Compose([
+        transforms.Lambda(to_rgb),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    data_folder = "/home/all/ljc/icon_data_all/siamese_data_test//"
+    image_folder = ImageFolder(data_folder)
+    siamese_dataset = SiameseDataset(image_folder, transform=data_transforms, n_pairs=10000)
+
+    batch_size = 32
+    num_epochs = 5
+    train_loader = torch.utils.data.DataLoader(siamese_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+    val_data_folder = "/home/all/ljc/icon_data_all/siamese_data_test//"
+    val_image_folder = ImageFolder(val_data_folder)
+    val_siamese_dataset = SiameseDataset(val_image_folder, transform=data_transforms, n_pairs=1000)
+    val_loader = torch.utils.data.DataLoader(val_siamese_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for batch_idx, (image_pairs, labels) in enumerate(train_loader):
+
+            image_pairs = (image_pairs[0].to(rank), image_pairs[1].to(rank))
+            labels = labels.to(rank)
+
+            siamese_network.train()
+            optimizer.zero_grad()
+
+            similarity_scores = siamese_network(image_pairs[0], image_pairs[1]).squeeze()
+
+            loss = criterion(similarity_scores, labels.squeeze())
+            total_loss += loss.item()
+            if rank == 0:
+                print(f"Epoch {epoch + 1}, Batch {batch_idx + 1}/{len(train_loader)}, Loss: {loss.item()}")
+
+            loss.backward()
+            optimizer.step()
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss}")
+
+        siamese_network.eval()
+        correct_predictions = 0
+        with torch.no_grad():
+            for (image_pairs, labels) in val_loader:
+                image_pairs = (image_pairs[0].to(rank), image_pairs[1].to(rank))  # Move image_pairs to the same device as the model
+                labels = labels.to(rank)  # Move labels to the same device as the model
+                similarity_scores = siamese_network(image_pairs[0], image_pairs[1]).squeeze()
+                correct_predictions += (similarity_scores.round() == labels.squeeze()).sum().item()
+
+
+        val_accuracy = correct_predictions / len(val_siamese_dataset)
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss}, Validation Accuracy: {val_accuracy}")
+
+        # Save the model if the validation accuracy has improved
+        if val_accuracy > best_accuracy:
+            best_accuracy = val_accuracy
+            if rank == 0:
+                torch.save(siamese_network.state_dict(), model_path)
+                print(f"Model saved with accuracy: {best_accuracy}")
+    torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    world_size = torch.cuda.device_count()
+    mp.spawn(train_ddp, args=(world_size,), nprocs=world_size, join=True)
+
+
+
+
