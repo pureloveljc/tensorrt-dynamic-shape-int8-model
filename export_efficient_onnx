@@ -76,3 +76,4 @@ with torch.no_grad():
     print('~~~~~~~~~')
     print(y_onnx)
     print("result", torch.max(torch.abs(y - y_onnx)))
+CUDA_VISIBLE_DEVICES=1 trtexec --onnx=/home/all/ljc/code_commit/EfficientNet-PyTorch/efficientnet_b0.onnx --saveEngine=/home/all/ljc/code_commit/EfficientNet-PyTorch/efficientnet_b0.trt --workspace=2048 --minShapes=input:1x224x224x3 --optShapes=input:16x224x224x3 --maxShapes=input:32x224x224x3 --fp16
